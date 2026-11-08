@@ -1,53 +1,48 @@
-# Plano: adaptar a mímica (head/arm) de K1 pra T2
+# Plan: adapting head/arm mimicry from the K1 to the T2
 
-Pesquisa feita em 2026-08-27, sem acesso físico a um T2 — baseado em specs públicas da Booster (booster.tech, docs.booster.tech, github.com/BoosterRobotics). Blocos marcados **[CONFIRMAR]** só dá pra fechar com acesso real ao robô/docs de dev.
+Research dated 2026-08-27, done **without physical access to a T2**, based on public Booster specs (booster.tech, docs.booster.tech, github.com/BoosterRobotics). Items marked **[CONFIRM]** can only be closed with access to a real robot or developer docs. Nothing here has been tested on a T2.
 
-## Diferenças de hardware que mudam o código
+## Hardware differences that affect the code
 
-| | K1 (atual) | T2 |
+| | K1 (current) | T2 |
 |---|---|---|
-| DoF total | 22 | 31 |
-| DoF por braço | 4 (ombro pitch/roll + cotovelo pitch/yaw) — **sem pulso** | 7 — quase certo que soma pulso roll/pitch/yaw |
-| Cintura | nenhuma | 3 DoF (nova) |
-| Cabeça | 2 DoF | 2 DoF (igual) |
-| Mão/end-effector | opcional no SDK, **não instalada** neste robô | end-effector configurável — **dá pra ter mão/garra destra de verdade** |
-| Câmera de pulso | não | opcional |
-| Compute | — | Jetson Thor T5000 (Professional) |
+| Total DoF | 22 | 31 |
+| DoF per arm | 4 (shoulder pitch/roll + elbow pitch/yaw), **no wrist** | 7, most likely including wrist roll/pitch/yaw |
+| Waist | none | 3 DoF (new) |
+| Head | 2 DoF | 2 DoF (same) |
+| Hand / end effector | optional in the SDK, **not installed** on this robot | configurable end effector, may include a right hand/gripper |
+| Wrist camera | no | optional |
+| Compute | n/a | Jetson Thor T5000 (Professional) |
 
-## O que precisa mudar em cada peça
+## What has to change in each piece
 
 ### 1. `mimicHead.py`
-Baixo risco. A lógica (Face Mesh + solvePnP + `rotate_head` via WS) não depende de DoF de braço/cintura. Só precisa confirmar que o T2 (ou o stack que rodar nele) expõe uma capacidade equivalente a `rotate_head` — **[CONFIRMAR]**.
+Low risk. The logic (Face Mesh + solvePnP + `rotate_head` over WebSocket) does not depend on arm or waist DoF. It only needs confirmation that the T2 (or whatever stack runs on it) exposes a capability equivalent to `rotate_head`. **[CONFIRM]**
 
 ### 2. `mimicArms.py`
-Mudança grande, não só porta. Hoje o código **fixa pulso em 0 de propósito** porque o K1 não tem essa junta:
-> "agora também larga qualquer conceito de 'orientação de mão' (roll/pitch/yaw do pulso ficam fixos em 0)"
+A larger change, not just a port. Today the code **pins the wrist to 0 on purpose** because the K1 has no such joint. On the T2 the wrist is a real joint, so this needs:
+- Wrist orientation from video. MediaPipe Pose alone does not provide this reliably; it would need MediaPipe Hands, using palm orientation relative to the forearm.
+- Three new angles in the WebSocket protocol (`move_arm` gains wrist roll/pitch/yaw, or a new op).
+- Re-calibrated signs and limits. Like `YAW_SIGN`/`PITCH_SIGN` in `mimicHead.py`, these must be rediscovered live on the T2, since each robot has its own sign convention (as seen on the K1).
 
-Pro T2, isso deixa de fazer sentido — o pulso é uma junta real. Precisa:
-- Extrair orientação de pulso do vídeo (MediaPipe Pose sozinho não dá isso direito — precisa complementar com MediaPipe Hands, olhando a orientação da palma em relação ao antebraço).
-- Mapear pra 3 ângulos novos no protocolo WS (`move_arm` ganha wrist_roll/pitch/yaw, ou um op novo).
-- Recalibrar sinais/limites — os `YAW_SIGN`/`PITCH_SIGN` tipo os do `mimicHead.py` vão ter que ser redescobertos ao vivo no T2, do zero (cada robô tem sua própria convenção de sinal, como já vimos com o K1).
+### 3. Hand / fingers (new capability)
+If the T2 ships with a hand installed, mimicry could be extended to fingers. That would need MediaPipe Hands (21 points per hand) instead of Pose only, and the T2's finger-control API. **[CONFIRM]** — no public RPC IDs found.
 
-### 3. Mão/dedos (capacidade NOVA, não existe hoje)
-Se o T2 de vocês vier com a mão destra instalada, dá pra estender a mímica pra dedos — isso conecta direto com o trabalho de CAD da mão que fizemos hoje (`k1-hand/`). Precisaria:
-- MediaPipe Hands (21 pontos por mão) em vez de só Pose.
-- Descobrir a API de controle de dedo do T2 — **[CONFIRMAR]**, não achei RPC IDs públicos.
+### 4. The robot-side motion service (not in this repository)
+This is the biggest piece, larger than the laptop scripts. It wraps the Booster C++ SDK (`B1LocoClient`) in a simple WebSocket protocol. For the T2:
+- Confirm whether the T2's `booster_robotics_sdk` still uses `B1LocoClient` (as on the K1/T1) or a new class. The official public repos (`booster_robotics_sdk`, `booster_assets`) explicitly document only the **T1 and K1** at the time of writing. **[CONFIRM]**
+- If the class is compatible, porting the adapter layer is mostly mechanical (config and joint names).
+- If not, the adapter layer must be rewritten for the new SDK.
+- Kinematics change (7-DoF arm vs. 4-DoF): any K1-specific angle/limit logic in the arm controller has to be redone, not just reused.
 
-### 4. O servidor `duxbot-motion` (lado robô)
-Essa é a peça que dá mais trabalho, maior que os scripts do Mac. `duxbot-motion` é código de vocês (não da Booster) que já embrulha o SDK C++ da Booster (`B1LocoClient`) num protocolo WS simples. Pro T2:
-- Confirmar se o `booster_robotics_sdk` do T2 ainda usa a classe `B1LocoClient` (mesma do K1/T1) ou se é uma classe nova — os repos públicos oficiais (`booster_robotics_sdk`, `booster_assets`) hoje só documentam **T1 e K1** explicitamente. T2 pode estar numa versão de SDK diferente. **[CONFIRMAR]**
-- Se a classe for compatível: portar `motion/adapters/driving/ws_server.py` + `booster_sdk.py` é relativamente mecânico (troca de config/joint names).
-- Se não for: reescrever a camada de adapter pro SDK novo do T2.
-- Cinemática muda (braço de 7 DoF ≠ 4 DoF) — qualquer lógica de ângulo/limite specific do K1 no `ArmController` precisa ser refeita, não só reaproveitada.
+## Suggested order once a T2 is available
 
-## Ordem sugerida quando o T2 chegar
+1. Run a `rotate_head` equivalent on the bare T2 (no extra software) to confirm basic SDK communication, as was done on the K1 originally.
+2. Port the minimal motion service (arm without wrist first), replicating what already works on the K1, to prove the stack survives a robot change.
+3. Only then extend to the wrist (3 new DoF) and, if applicable, fingers.
+4. Keep the waist (3 DoF) out of the initial scope; there is no reason yet to mimic the waist from a webcam.
 
-1. Rodar só `rotate_head`-equivalente no T2 puro (sem DUXBOT), confirmar que dá pra falar com o robô via SDK básico — igual foi feito no K1 originalmente.
-2. Portar/adaptar o `duxbot-motion` mínimo (braço sem pulso primeiro, replicando o que já funciona no K1) — prova que a base do stack sobrevive à troca de robô.
-3. Só depois, estender pra pulso (3 DoF novos) e, se aplicável, dedos.
-4. Cintura (3 DoF) fica de fora do escopo inicial — não tem porquê copiar cintura numa mímica de webcam ainda.
+## Real blockers (cannot be resolved without the robot)
 
-## Bloqueios reais (não dá pra resolver sem o robô)
-
-- Nomes exatos das juntas novas, limites de ângulo, IDs de RPC — só com o SDK/docs de dev do T2 na mão, ou (como rolou com o conector) perguntando direto pro suporte da Booster.
-- Convenção de sinal de cada eixo novo — só testando ao vivo.
+- Exact names of the new joints, angle limits and RPC IDs: only with the T2 SDK/developer docs in hand, or by asking Booster support directly.
+- Sign convention of each new axis: only by testing live.

@@ -1,27 +1,29 @@
-"""Mimetismo de cabeça: webcam do Mac -> MediaPipe Face Mesh + solvePnP -> WS
-rotate_head no robô.
+"""Head mimicry: webcam -> MediaPipe Face Mesh + solvePnP -> `rotate_head` over
+WebSocket to a Booster K1.
 
-v2 (2026-08-12): a v1 usava só a posição do nariz relativa ao ombro (MediaPipe Pose) —
-um proxy FRACO pra rotação da cabeça, porque girar só a cabeça (sem girar o corpo)
-desloca o nariz muito pouco na imagem, mesmo numa virada grande. Resultado: "micro
-movimentos", não acompanhava giros de verdade (relatado pelo usuário em teste ao vivo).
+v2 (2026-08-12): v1 used only the nose position relative to the shoulder (MediaPipe
+Pose). That is a WEAK proxy for head rotation: turning the head without turning the
+body moves the nose very little in the image, even for a large turn. Result: "micro
+movements" that did not follow real head turns (observed in a live test).
 
-v2 estima a ORIENTAÇÃO 3D real da cabeça: 6 pontos-chave do rosto (MediaPipe Face Mesh)
-+ um modelo 3D genérico de face + cv2.solvePnP (técnica clássica de head pose
-estimation, mesma usada em tutoriais de OpenCV/dlib). Isso mede ROTAÇÃO diretamente,
-não uma translação de proxy — muito mais sensível a giros reais da cabeça.
+v2 estimates the real 3D head ORIENTATION: six Face Mesh landmarks + a generic 3D face
+model + cv2.solvePnP (the classic head-pose-estimation technique used in OpenCV/dlib
+tutorials). This measures rotation directly instead of a translation proxy, so it is
+far more sensitive to actual head turns.
 
-Manda via WS pro duxbot-motion (:8765) usando "rotate_head" — capacidade JÁ existente
-e comprovada no robô (não precisou de nenhum código novo do lado do robô).
+Commands are sent to a robot-side WebSocket motion service (not included in this
+repository) using the `rotate_head` op, which already existed and was verified on the
+robot, so no robot-side code change was needed.
 
-Uso:
-  ROBOT_IP=192.168.0.62 python3 mimicHead.py
+Usage:
+  ROBOT_IP=<robot-ip> python3 mimicHead.py
 
-ESC fecha a janela e centraliza a cabeça (yaw=0, pitch=0) antes de sair.
+ESC closes the window and re-centers the head (yaw=0, pitch=0) before exiting.
 
-Sinal/direção: solvePnP não garante que o sinal do yaw/pitch bata com a convenção do
-robô de cara — YAW_SIGN/PITCH_SIGN abaixo existem pra inverter rápido se o robô girar
-pro lado errado no primeiro teste real (visto e ajustado ao vivo).
+Sign/direction: solvePnP does not guarantee that the yaw/pitch signs match the robot's
+convention out of the box. YAW_SIGN / PITCH_SIGN below exist so they can be flipped
+quickly if the robot turns the wrong way on the first real test (this was seen and
+adjusted live).
 """
 from __future__ import annotations
 
@@ -37,37 +39,36 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
-# Envelope conservador (dentro do provado no CLI de exemplo do SDK: yaw ate ~0.785,
-# pitch -0.3..1.0) — aqui mais contido pra mimetismo suave.
+# Conservative envelope (inside what was verified with the SDK's example CLI: yaw up to
+# ~0.785, pitch -0.3..1.0), tightened here for smooth mimicry.
 YAW_MAX = 0.7
 PITCH_MIN, PITCH_MAX = -0.25, 0.45
 SEND_HZ = 8.0
 YAW_SIGN = 1.0
 PITCH_SIGN = 1.0
 
-# Estabilidade do solvePnP: com so 6 pontos e sem continuidade entre frames, a pose
-# pode "pular" pra uma solucao alternativa ambigua a cada frame (visto ao vivo:
-# pitch=79 do nada). Duas defesas: (1) usa a estimativa do frame anterior como chute
-# inicial (useExtrinsicGuess) — o solver tende a ficar perto da solucao anterior em vez
-# de pular pra outra; (2) EMA + limite de salto maximo por atualizacao nos angulos
-# finais, filtrando o que ainda passar.
-SMOOTH_ALPHA = 0.35       # EMA: menor = mais suave/mais atraso
-MAX_DELTA_DEG = 15.0      # salto maximo aceito por atualizacao (~a cada 1/SEND_HZ s)
+# solvePnP stability: with only 6 points and no continuity between frames, the pose can
+# "jump" to an ambiguous alternative solution on any frame (seen live: pitch=79 out of
+# nowhere). Two defenses: (1) use the previous frame's estimate as the initial guess
+# (useExtrinsicGuess) so the solver stays near the previous solution instead of jumping
+# to another one; (2) EMA + a maximum per-update jump on the final angles, filtering
+# whatever still gets through.
+SMOOTH_ALPHA = 0.35       # EMA: lower = smoother but more lag
+MAX_DELTA_DEG = 15.0      # max accepted jump per update (~every 1/SEND_HZ s)
 
-# Modelo 3D generico de face (unidades arbitrarias, mesma referencia usada em
-# tutoriais classicos de head pose estimation com OpenCV/dlib) — ordem tem que bater
-# com FACE_LANDMARK_IDX abaixo.
+# Generic 3D face model (arbitrary units, the same reference used in classic OpenCV/dlib
+# head-pose tutorials). Order must match FACE_LANDMARK_IDX below.
 MODEL_POINTS = np.array([
-    (0.0, 0.0, 0.0),          # ponta do nariz
-    (0.0, -330.0, -65.0),     # queixo
-    (-225.0, 170.0, -135.0),  # canto externo do olho esquerdo (da pessoa)
-    (225.0, 170.0, -135.0),   # canto externo do olho direito (da pessoa)
-    (-150.0, -150.0, -125.0), # canto da boca esquerdo
-    (150.0, -150.0, -125.0),  # canto da boca direito
+    (0.0, 0.0, 0.0),          # nose tip
+    (0.0, -330.0, -65.0),     # chin
+    (-225.0, 170.0, -135.0),  # outer corner of the person's left eye
+    (225.0, 170.0, -135.0),   # outer corner of the person's right eye
+    (-150.0, -150.0, -125.0), # left mouth corner
+    (150.0, -150.0, -125.0),  # right mouth corner
 ], dtype="double")
 
-# Indices no topology do MediaPipe Face Mesh (468/478 pontos) correspondentes, na
-# MESMA ordem do MODEL_POINTS acima.
+# Matching indices in the MediaPipe Face Mesh topology (468/478 points), in the SAME
+# order as MODEL_POINTS above.
 FACE_LANDMARK_IDX = [1, 152, 33, 263, 61, 291]
 
 
@@ -76,9 +77,11 @@ def clamp(v, lo, hi):
 
 
 class WSClient:
+    """Minimal RFC 6455 WebSocket client (stdlib only, text frames < 64 KiB)."""
+
     def __init__(self, host: str, port: int):
         self.sock = socket.create_connection((host, port), timeout=5)
-        key = "duxbot-mimic-head-key=="
+        key = "k1-mimic-head-key=="
         req = (
             f"GET / HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
             f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
@@ -86,7 +89,7 @@ class WSClient:
         self.sock.sendall(req.encode())
         resp = self.sock.recv(4096)
         if b"101" not in resp:
-            raise RuntimeError(f"handshake WS falhou: {resp!r}")
+            raise RuntimeError(f"WebSocket handshake failed: {resp!r}")
         self.sock.settimeout(2.0)
 
     def send(self, msg: dict) -> dict | None:
@@ -117,10 +120,10 @@ class WSClient:
             return None
 
     def send_nowait(self, msg: dict) -> None:
-        """Manda sem esperar resposta — o robô hoje está com RPC lento (visto em
-        sessão de testes 2026-08-12), então esperar a resposta no loop de vídeo
-        trava a imagem inteira. Fogo-e-esquece: qualquer reply que chegar depois
-        fica boiando no socket buffer e é descartado no próximo send()/close()."""
+        """Send without waiting for a reply. The robot's RPC was slow during testing
+        (2026-08-12), so waiting for the reply inside the video loop froze the whole
+        camera feed. Fire-and-forget: any reply that arrives later sits in the socket
+        buffer and is discarded by the next send()/drain()/close()."""
         data = json.dumps(msg).encode()
         mask = os.urandom(4)
         masked = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
@@ -132,12 +135,12 @@ class WSClient:
         try:
             self.sock.sendall(hdr + mask + masked)
         except OSError as e:
-            print(f"[mimic-head] send_nowait falhou: {e}")
+            print(f"[mimic-head] send_nowait failed: {e}")
 
     def drain(self) -> None:
-        """Descarta qualquer resposta parada no buffer (best-effort, nao-bloqueante) —
-        chamar periodicamente enquanto usa send_nowait, senao o buffer cresce sem
-        controle numa sessao longa."""
+        """Discard any reply left in the buffer (best-effort, non-blocking). Call
+        periodically while using send_nowait, otherwise the buffer grows without
+        bound in a long session."""
         try:
             while select.select([self.sock], [], [], 0)[0]:
                 if not self.sock.recv(4096):
@@ -155,13 +158,13 @@ class WSClient:
 def main():
     host = os.environ.get("ROBOT_IP")
     if not host:
-        print("Defina ROBOT_IP (ex.: ROBOT_IP=192.168.0.62 python3 mimicHead.py)")
+        print("Set ROBOT_IP (e.g. ROBOT_IP=<robot-ip> python3 mimicHead.py)")
         sys.exit(1)
     port = int(os.environ.get("ROBOT_MOTION_PORT", "8765"))
 
-    print(f"[mimic-head] conectando ws://{host}:{port} ...", flush=True)
+    print(f"[mimic-head] connecting to ws://{host}:{port} ...", flush=True)
     ws = WSClient(host, port)
-    print("[mimic-head] conectado. ESC na janela da webcam pra sair.", flush=True)
+    print("[mimic-head] connected. Press ESC in the webcam window to quit.", flush=True)
 
     mp_face = mp.solutions.face_mesh
 
@@ -183,6 +186,8 @@ def main():
                     continue
 
                 if frame_w is None:
+                    # Approximate pinhole camera: focal length ~ image width, optical
+                    # center at the image center, no lens distortion.
                     frame_h, frame_w = frame.shape[:2]
                     focal = frame_w
                     center = (frame_w / 2, frame_h / 2)
@@ -202,8 +207,8 @@ def main():
 
                 if results.multi_face_landmarks:
                     face_lm = results.multi_face_landmarks[0].landmark
-                    # pontinhos de debug nos 6 landmarks usados (feedback visual de que
-                    # a deteccao esta pegando os pontos certos).
+                    # Debug dots on the 6 landmarks in use (visual feedback that
+                    # detection is picking the right points).
                     for idx in FACE_LANDMARK_IDX:
                         p = face_lm[idx]
                         cv2.circle(frame, (int(p.x * frame_w), int(p.y * frame_h)), 3, (0, 255, 0), -1)
@@ -227,16 +232,16 @@ def main():
                             pose_mat = cv2.hconcat((rot_mat, np.zeros((3, 1))))
                             _, _, _, _, _, _, euler = cv2.decomposeProjectionMatrix(pose_mat)
                             pitch_deg, yaw_deg, _roll_deg = euler.flatten()
-                            # decomposeProjectionMatrix pode devolver o pitch "invertido"
-                            # (>90 ou <-90) por ambiguidade de sinal do solvePnP — normaliza
-                            # pro intervalo -90..90 antes de converter.
+                            # decomposeProjectionMatrix can return the pitch "flipped"
+                            # (>90 or <-90) because of solvePnP's sign ambiguity;
+                            # normalize to -90..90 before converting.
                             if pitch_deg > 90:
                                 pitch_deg -= 180
                             elif pitch_deg < -90:
                                 pitch_deg += 180
 
-                            # limite de salto + EMA — filtra os picos que passarem do
-                            # useExtrinsicGuess (ruido de landmark ainda existe).
+                            # Jump limit + EMA: filters spikes that get past
+                            # useExtrinsicGuess (landmark noise is still present).
                             if smooth_yaw_deg is None:
                                 smooth_yaw_deg, smooth_pitch_deg = yaw_deg, pitch_deg
                             else:
@@ -257,19 +262,19 @@ def main():
                                   f"-> yaw={yaw:.2f} pitch={pitch:.2f}", flush=True)
 
                 ws.drain()
-                cv2.imshow("Mimic Head (ESC sai)", cv2.flip(frame, 1))
+                cv2.imshow("Mimic Head (ESC to quit)", cv2.flip(frame, 1))
                 if cv2.waitKey(1) & 0xFF == 27:
                     break
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        print("[mimic-head] centralizando a cabeca antes de sair...")
+        print("[mimic-head] re-centering head before exit...")
         try:
             print(ws.send({"op": "rotate_head", "pitch": 0.0, "yaw": 0.0}))
         except Exception as e:  # noqa: BLE001
-            print(f"[mimic-head] centralizar falhou (ignorando): {e}")
+            print(f"[mimic-head] re-centering failed (ignoring): {e}")
         ws.close()
-        print("[mimic-head] encerrado.")
+        print("[mimic-head] stopped.")
 
 
 if __name__ == "__main__":
